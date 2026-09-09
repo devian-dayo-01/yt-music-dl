@@ -20,179 +20,241 @@ jobs:
         with:
           fetch-depth: 0
 
+      # ------------------------------------------------------------
+      # 1. ZIPを探す
+      # ------------------------------------------------------------
       - name: Find uploaded ZIP
         id: zip
         shell: bash
         run: |
           set -euo pipefail
 
-          ZIP_FILE=$(find . \
+          ZIP_FILE="$(find . \
             -type f \
             -iname "*.zip" \
             -not -path "./.git/*" \
             -not -path "./.github/*" \
-            | head -n 1)
+            -print \
+            | head -n 1)"
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: No ZIP file found."
+            echo "ERROR: ZIP file was not found."
             exit 1
           fi
 
           ZIP_FILE="${ZIP_FILE#./}"
 
-          echo "ZIP found: $ZIP_FILE"
-          echo "path=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+          echo "Found ZIP:"
+          echo "$ZIP_FILE"
 
-      - name: Prepare extraction directory
-        shell: bash
-        run: |
-          set -euo pipefail
+          echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
 
-          rm -rf .zip_extract
-          mkdir -p .zip_extract
-
-      - name: Extract ZIP
+      # ------------------------------------------------------------
+      # 2. /tmpへ安全に展開
+      # ------------------------------------------------------------
+      - name: Extract ZIP safely
+        id: extract
         env:
-          ZIP_FILE: ${{ steps.zip.outputs.path }}
+          ZIP_FILE: ${{ steps.zip.outputs.zip_file }}
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 <<'PY'
-          import os
+          EXTRACT_DIR="/tmp/yt_music_zip_extract"
+
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+
+          echo "Extract directory:"
+          echo "$EXTRACT_DIR"
+
+          python3 - "$ZIP_FILE" "$EXTRACT_DIR" <<'PY'
+          import sys
           import zipfile
           from pathlib import Path
 
-          zip_path = Path(os.environ["ZIP_FILE"]).resolve()
-          destination = Path(".zip_extract").resolve()
+          zip_path = Path(sys.argv[1]).resolve()
+          destination = Path(sys.argv[2]).resolve()
 
-          print(f"ZIP: {zip_path}")
-          print(f"Destination: {destination}")
+          print("ZIP:", zip_path)
+          print("Destination:", destination)
 
-          with zipfile.ZipFile(zip_path, "r") as archive:
+          if not zip_path.is_file():
+              raise RuntimeError(f"ZIP file does not exist: {zip_path}")
 
-              members = archive.infolist()
+          with zipfile.ZipFile(zip_path, "r") as z:
+              members = z.infolist()
 
               if not members:
                   raise RuntimeError("ZIP file is empty.")
 
+              print("")
               print("ZIP contents:")
 
               for member in members:
-                  print(" -", member.filename)
+                  name = member.filename
 
-                  target = (destination / member.filename).resolve()
+                  print(" -", name)
+
+                  # Absolute path protection
+                  member_path = Path(name)
+
+                  if member_path.is_absolute():
+                      raise RuntimeError(
+                          f"Unsafe absolute path in ZIP: {name}"
+                      )
 
                   # Zip Slip protection
+                  target = (destination / member_path).resolve()
+
                   try:
                       target.relative_to(destination)
                   except ValueError:
                       raise RuntimeError(
-                          f"Unsafe ZIP entry detected: {member.filename}"
+                          f"Unsafe path in ZIP: {name}"
                       )
 
-              archive.extractall(destination)
+              z.extractall(destination)
 
-          print("ZIP extraction completed.")
+          print("")
+          print("ZIP extraction completed successfully.")
           PY
 
-      - name: Verify extracted files
+          echo "extract_dir=$EXTRACT_DIR" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------
+      # 3. 展開結果を確認
+      # ------------------------------------------------------------
+      - name: Verify extracted application
+        id: root
+        env:
+          EXTRACT_DIR: ${{ steps.extract.outputs.extract_dir }}
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "========== Extracted files =========="
+          echo "========================================"
+          echo "Extracted files"
+          echo "========================================"
 
-          find .zip_extract \
-            -maxdepth 5 \
-            -type f \
+          find "$EXTRACT_DIR" \
+            -maxdepth 6 \
             -print \
             | sort
 
-          FILE_COUNT=$(find .zip_extract -type f | wc -l)
+          echo ""
+
+          FILE_COUNT="$(find "$EXTRACT_DIR" -type f | wc -l)"
 
           if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "ERROR: ZIP extraction produced no files."
+            echo "ERROR: ZIP contains no files."
             exit 1
           fi
 
-          echo
-          echo "Extracted $FILE_COUNT file(s)."
+          echo "Files extracted: $FILE_COUNT"
 
-      - name: Detect application root
-        id: root
-        shell: bash
-        run: |
-          set -euo pipefail
+          # --------------------------------------------------------
+          # ZIPの構造を判定
+          #
+          # パターンA:
+          #   main.py
+          #   requirements.txt
+          #   templates/
+          #
+          # パターンB:
+          #   yt-music-dl/
+          #     main.py
+          #     requirements.txt
+          #     templates/
+          #
+          # どちらにも対応
+          # --------------------------------------------------------
 
-          ROOT=".zip_extract"
+          APP_ROOT="$EXTRACT_DIR"
 
-          # If the ZIP contains exactly one directory and nothing else,
-          # use that directory as the application root.
-          mapfile -t ITEMS < <(
-            find .zip_extract \
+          mapfile -t ROOT_ITEMS < <(
+            find "$EXTRACT_DIR" \
               -mindepth 1 \
               -maxdepth 1 \
-              -printf "%y %p\n" \
+              -printf "%y\t%p\n" \
               | sort
           )
 
-          if [ "${#ITEMS[@]}" -eq 1 ]; then
-            ITEM_TYPE="${ITEMS[0]:0:1}"
-            ITEM_PATH="${ITEMS[0]:2}"
+          if [ "${#ROOT_ITEMS[@]}" -eq 1 ]; then
+            ITEM_TYPE="${ROOT_ITEMS[0]%%$'\t'*}"
+            ITEM_PATH="${ROOT_ITEMS[0]#*$'\t'}"
 
             if [ "$ITEM_TYPE" = "d" ]; then
-              ROOT="$ITEM_PATH"
-              echo "Detected ZIP root directory: $ROOT"
-            else
-              echo "ZIP contains files directly at root."
+              APP_ROOT="$ITEM_PATH"
+
+              echo ""
+              echo "ZIP has one parent directory."
+              echo "Application root:"
+              echo "$APP_ROOT"
             fi
-          else
-            echo "ZIP contains multiple root entries."
           fi
 
-          if [ ! -d "$ROOT" ]; then
-            echo "ERROR: Application root does not exist: $ROOT"
+          if [ ! -d "$APP_ROOT" ]; then
+            echo "ERROR: Application root does not exist."
             exit 1
           fi
 
-          echo "Application root: $ROOT"
-          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
-
-      - name: Validate application
-        env:
-          APP_ROOT: ${{ steps.root.outputs.root }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "========== Application contents =========="
+          echo ""
+          echo "========================================"
+          echo "Application root contents"
+          echo "========================================"
 
           find "$APP_ROOT" \
             -maxdepth 5 \
             -print \
             | sort
 
-          if [ -f "$APP_ROOT/main.py" ]; then
-            echo
-            echo "main.py found."
-          else
-            echo
-            echo "WARNING: main.py was not found."
-          fi
+          # 必須ファイルを先に確認
+          echo ""
+          echo "Checking required files..."
 
-          if [ -f "$APP_ROOT/requirements.txt" ]; then
-            echo "requirements.txt found."
-          else
-            echo "WARNING: requirements.txt was not found."
-          fi
+          test -f "$APP_ROOT/main.py"
+          test -f "$APP_ROOT/requirements.txt"
+          test -f "$APP_ROOT/templates/index.html"
+          test -f "$APP_ROOT/static/main.js"
+          test -f "$APP_ROOT/static/style.css"
 
+          echo "All required files found."
+
+          echo "app_root=$APP_ROOT" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------
+      # 4. Python構文チェック
+      # ------------------------------------------------------------
+      - name: Validate Python
+        env:
+          APP_ROOT: ${{ steps.root.outputs.app_root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking Python syntax..."
+
+          python3 -m py_compile "$APP_ROOT/main.py"
+
+          echo "Python syntax: OK"
+
+      # ------------------------------------------------------------
+      # 5. ZIPを除いて既存アプリを完全削除
+      #
+      # .git
+      # .github
+      # .gitignore
+      # .gitattributes
+      #
+      # は保持する。
+      # ------------------------------------------------------------
       - name: Remove old application
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Removing old application files..."
+          echo "Removing old application..."
 
           find . \
             -mindepth 1 \
@@ -205,9 +267,15 @@ jobs:
 
           echo "Old application removed."
 
+      # ------------------------------------------------------------
+      # 6. 新しいアプリをコピー
+      #
+      # 展開場所は /tmp なので、
+      # 5の削除処理で消えることは絶対にない。
+      # ------------------------------------------------------------
       - name: Install new application
         env:
-          APP_ROOT: ${{ steps.root.outputs.root }}
+          APP_ROOT: ${{ steps.root.outputs.app_root }}
         shell: bash
         run: |
           set -euo pipefail
@@ -215,26 +283,38 @@ jobs:
           echo "Installing application from:"
           echo "$APP_ROOT"
 
-          # The extracted directory is still present.
-          # Copy everything, including hidden files.
+          if [ ! -d "$APP_ROOT" ]; then
+            echo "ERROR: Application root disappeared."
+            echo "Expected:"
+            echo "$APP_ROOT"
+            exit 1
+          fi
+
           cp -a "$APP_ROOT"/. .
 
-          echo "New application installed."
+          echo ""
+          echo "Application installed successfully."
 
+      # ------------------------------------------------------------
+      # 7. ZIPと一時ファイルを削除
+      # ------------------------------------------------------------
       - name: Clean temporary files
         env:
-          ZIP_FILE: ${{ steps.zip.outputs.path }}
+          ZIP_FILE: ${{ steps.zip.outputs.zip_file }}
+          EXTRACT_DIR: ${{ steps.extract.outputs.extract_dir }}
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf .zip_extract
+          echo "Cleaning temporary files..."
 
-          if [ -n "$ZIP_FILE" ] && [ -f "$ZIP_FILE" ]; then
+          rm -rf "$EXTRACT_DIR"
+
+          if [ -f "$ZIP_FILE" ]; then
             rm -f "$ZIP_FILE"
           fi
 
-          # Remove any other uploaded ZIP files.
+          # 残っているZIPもすべて削除
           find . \
             -type f \
             -iname "*.zip" \
@@ -242,32 +322,28 @@ jobs:
             -not -path "./.github/*" \
             -delete
 
-          echo "Temporary files removed."
+          echo "Temporary files cleaned."
 
-      - name: Verify final repository
+      # ------------------------------------------------------------
+      # 8. 最終チェック
+      # ------------------------------------------------------------
+      - name: Verify final application
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "========== Final repository =========="
+          echo "========================================"
+          echo "Final application"
+          echo "========================================"
 
           find . \
             -maxdepth 5 \
             -not -path "./.git/*" \
-            -not -path "./.github/*" \
             -print \
             | sort
 
-          echo
-          echo "========== Python syntax check =========="
-
-          if [ -f "main.py" ]; then
-            python3 -m py_compile main.py
-            echo "main.py syntax: OK"
-          fi
-
-          echo
-          echo "========== Required files =========="
+          echo ""
+          echo "Checking required files..."
 
           test -f "main.py"
           test -f "requirements.txt"
@@ -277,6 +353,21 @@ jobs:
 
           echo "Required files: OK"
 
+          echo ""
+          echo "Checking Python syntax..."
+
+          python3 -m py_compile main.py
+
+          echo "Python syntax: OK"
+
+          echo ""
+          echo "========================================"
+          echo "FINAL VERIFICATION PASSED"
+          echo "========================================"
+
+      # ------------------------------------------------------------
+      # 9. Gitへコミット
+      # ------------------------------------------------------------
       - name: Commit changes
         shell: bash
         run: |
@@ -294,11 +385,19 @@ jobs:
 
           git commit -m "Update application from uploaded ZIP"
 
+          echo "Commit created."
+
+      # ------------------------------------------------------------
+      # 10. GitHubへPush
+      # ------------------------------------------------------------
       - name: Push changes
         shell: bash
         run: |
           set -euo pipefail
 
-          git push origin HEAD:${GITHUB_REF_NAME}
+          git push origin "HEAD:${GITHUB_REF_NAME}"
 
-          echo "Changes pushed successfully."
+          echo ""
+          echo "========================================"
+          echo "PUSH SUCCESSFUL"
+          echo "========================================"
