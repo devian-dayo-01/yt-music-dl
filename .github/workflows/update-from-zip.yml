@@ -1,0 +1,172 @@
+name: Update app from ZIP
+
+on:
+  push:
+    paths:
+      - "*.zip"
+      - "**/*.zip"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find uploaded ZIP
+        id: zip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="$(find . -type f -iname '*.zip' \
+            -not -path './.git/*' \
+            -not -path './.github/*' \
+            | head -n 1)"
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "No ZIP file found."
+            exit 1
+          fi
+
+          echo "Found: $ZIP_FILE"
+          echo "path=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Extract ZIP safely
+        env:
+          ZIP_FILE: ${{ steps.zip.outputs.path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf .zip_extract
+          mkdir -p .zip_extract
+
+          python3 <<'PY'
+          import os
+          import zipfile
+          from pathlib import Path
+
+          zip_path = Path(os.environ["ZIP_FILE"]).resolve()
+          destination = Path(".zip_extract").resolve()
+
+          with zipfile.ZipFile(zip_path, "r") as z:
+              for member in z.infolist():
+                  target = (destination / member.filename).resolve()
+
+                  if not str(target).startswith(str(destination) + os.sep):
+                      raise RuntimeError(
+                          f"Unsafe ZIP entry detected: {member.filename}"
+                      )
+
+                  z.extract(member, destination)
+
+          print("ZIP extracted successfully.")
+          PY
+
+      - name: Detect ZIP root directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          shopt -s dotglob nullglob
+
+          entries=(.zip_extract/*)
+
+          if [ "${#entries[@]}" -eq 1 ] && [ -d "${entries[0]}" ]; then
+            echo "ZIP contains a single root directory."
+            echo "ZIP_ROOT=${entries[0]}" >> "$GITHUB_ENV"
+          else
+            echo "ZIP contains files at its root."
+            echo "ZIP_ROOT=.zip_extract" >> "$GITHUB_ENV"
+          fi
+
+      - name: Remove old application files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Removing old application files..."
+
+          find . -mindepth 1 -maxdepth 1 \
+            ! -name '.git' \
+            ! -name '.github' \
+            ! -name '.gitignore' \
+            ! -name '.gitattributes' \
+            -exec rm -rf {} +
+
+          echo "Old application files removed."
+
+      - name: Install new application files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          shopt -s dotglob nullglob
+
+          cp -a "$ZIP_ROOT"/. .
+
+          echo "New application files installed."
+
+      - name: Remove uploaded ZIP and temporary files
+        env:
+          ZIP_FILE: ${{ steps.zip.outputs.path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf .zip_extract
+          rm -f "$ZIP_FILE"
+
+          find . -type f -iname '*.zip' \
+            -not -path './.git/*' \
+            -not -path './.github/*' \
+            -delete
+
+          echo "Temporary files removed."
+
+      - name: Verify application
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========== Repository =========="
+          find . -maxdepth 3 \
+            -not -path './.git/*' \
+            -not -path './.github/*' \
+            -print | sort
+
+          echo
+          echo "========== Python syntax check =========="
+
+          if [ -f "main.py" ]; then
+            python3 -m py_compile main.py
+            echo "main.py OK"
+          else
+            echo "WARNING: main.py not found."
+          fi
+
+      - name: Commit and push changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update application from uploaded ZIP"
+          git push
