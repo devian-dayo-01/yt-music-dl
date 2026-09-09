@@ -26,28 +26,37 @@ jobs:
         run: |
           set -euo pipefail
 
-          ZIP_FILE="$(find . -type f -iname '*.zip' \
-            -not -path './.git/*' \
-            -not -path './.github/*' \
-            | head -n 1)"
+          ZIP_FILE=$(find . \
+            -type f \
+            -iname "*.zip" \
+            -not -path "./.git/*" \
+            -not -path "./.github/*" \
+            | head -n 1)
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "No ZIP file found."
+            echo "ERROR: No ZIP file found."
             exit 1
           fi
 
-          echo "Found: $ZIP_FILE"
+          ZIP_FILE="${ZIP_FILE#./}"
+
+          echo "ZIP found: $ZIP_FILE"
           echo "path=$ZIP_FILE" >> "$GITHUB_OUTPUT"
 
-      - name: Extract ZIP safely
-        env:
-          ZIP_FILE: ${{ steps.zip.outputs.path }}
+      - name: Prepare extraction directory
         shell: bash
         run: |
           set -euo pipefail
 
           rm -rf .zip_extract
           mkdir -p .zip_extract
+
+      - name: Extract ZIP
+        env:
+          ZIP_FILE: ${{ steps.zip.outputs.path }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
           python3 <<'PY'
           import os
@@ -57,65 +66,162 @@ jobs:
           zip_path = Path(os.environ["ZIP_FILE"]).resolve()
           destination = Path(".zip_extract").resolve()
 
-          with zipfile.ZipFile(zip_path, "r") as z:
-              for member in z.infolist():
+          print(f"ZIP: {zip_path}")
+          print(f"Destination: {destination}")
+
+          with zipfile.ZipFile(zip_path, "r") as archive:
+
+              members = archive.infolist()
+
+              if not members:
+                  raise RuntimeError("ZIP file is empty.")
+
+              print("ZIP contents:")
+
+              for member in members:
+                  print(" -", member.filename)
+
                   target = (destination / member.filename).resolve()
 
-                  if not str(target).startswith(str(destination) + os.sep):
+                  # Zip Slip protection
+                  try:
+                      target.relative_to(destination)
+                  except ValueError:
                       raise RuntimeError(
                           f"Unsafe ZIP entry detected: {member.filename}"
                       )
 
-                  z.extract(member, destination)
+              archive.extractall(destination)
 
-          print("ZIP extracted successfully.")
+          print("ZIP extraction completed.")
           PY
 
-      - name: Detect ZIP root directory
+      - name: Verify extracted files
         shell: bash
         run: |
           set -euo pipefail
 
-          shopt -s dotglob nullglob
+          echo "========== Extracted files =========="
 
-          entries=(.zip_extract/*)
+          find .zip_extract \
+            -maxdepth 5 \
+            -type f \
+            -print \
+            | sort
 
-          if [ "${#entries[@]}" -eq 1 ] && [ -d "${entries[0]}" ]; then
-            echo "ZIP contains a single root directory."
-            echo "ZIP_ROOT=${entries[0]}" >> "$GITHUB_ENV"
-          else
-            echo "ZIP contains files at its root."
-            echo "ZIP_ROOT=.zip_extract" >> "$GITHUB_ENV"
+          FILE_COUNT=$(find .zip_extract -type f | wc -l)
+
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "ERROR: ZIP extraction produced no files."
+            exit 1
           fi
 
-      - name: Remove old application files
+          echo
+          echo "Extracted $FILE_COUNT file(s)."
+
+      - name: Detect application root
+        id: root
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT=".zip_extract"
+
+          # If the ZIP contains exactly one directory and nothing else,
+          # use that directory as the application root.
+          mapfile -t ITEMS < <(
+            find .zip_extract \
+              -mindepth 1 \
+              -maxdepth 1 \
+              -printf "%y %p\n" \
+              | sort
+          )
+
+          if [ "${#ITEMS[@]}" -eq 1 ]; then
+            ITEM_TYPE="${ITEMS[0]:0:1}"
+            ITEM_PATH="${ITEMS[0]:2}"
+
+            if [ "$ITEM_TYPE" = "d" ]; then
+              ROOT="$ITEM_PATH"
+              echo "Detected ZIP root directory: $ROOT"
+            else
+              echo "ZIP contains files directly at root."
+            fi
+          else
+            echo "ZIP contains multiple root entries."
+          fi
+
+          if [ ! -d "$ROOT" ]; then
+            echo "ERROR: Application root does not exist: $ROOT"
+            exit 1
+          fi
+
+          echo "Application root: $ROOT"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: Validate application
+        env:
+          APP_ROOT: ${{ steps.root.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========== Application contents =========="
+
+          find "$APP_ROOT" \
+            -maxdepth 5 \
+            -print \
+            | sort
+
+          if [ -f "$APP_ROOT/main.py" ]; then
+            echo
+            echo "main.py found."
+          else
+            echo
+            echo "WARNING: main.py was not found."
+          fi
+
+          if [ -f "$APP_ROOT/requirements.txt" ]; then
+            echo "requirements.txt found."
+          else
+            echo "WARNING: requirements.txt was not found."
+          fi
+
+      - name: Remove old application
         shell: bash
         run: |
           set -euo pipefail
 
           echo "Removing old application files..."
 
-          find . -mindepth 1 -maxdepth 1 \
-            ! -name '.git' \
-            ! -name '.github' \
-            ! -name '.gitignore' \
-            ! -name '.gitattributes' \
+          find . \
+            -mindepth 1 \
+            -maxdepth 1 \
+            ! -name ".git" \
+            ! -name ".github" \
+            ! -name ".gitignore" \
+            ! -name ".gitattributes" \
             -exec rm -rf {} +
 
-          echo "Old application files removed."
+          echo "Old application removed."
 
-      - name: Install new application files
+      - name: Install new application
+        env:
+          APP_ROOT: ${{ steps.root.outputs.root }}
         shell: bash
         run: |
           set -euo pipefail
 
-          shopt -s dotglob nullglob
+          echo "Installing application from:"
+          echo "$APP_ROOT"
 
-          cp -a "$ZIP_ROOT"/. .
+          # The extracted directory is still present.
+          # Copy everything, including hidden files.
+          cp -a "$APP_ROOT"/. .
 
-          echo "New application files installed."
+          echo "New application installed."
 
-      - name: Remove uploaded ZIP and temporary files
+      - name: Clean temporary files
         env:
           ZIP_FILE: ${{ steps.zip.outputs.path }}
         shell: bash
@@ -123,37 +229,55 @@ jobs:
           set -euo pipefail
 
           rm -rf .zip_extract
-          rm -f "$ZIP_FILE"
 
-          find . -type f -iname '*.zip' \
-            -not -path './.git/*' \
-            -not -path './.github/*' \
+          if [ -n "$ZIP_FILE" ] && [ -f "$ZIP_FILE" ]; then
+            rm -f "$ZIP_FILE"
+          fi
+
+          # Remove any other uploaded ZIP files.
+          find . \
+            -type f \
+            -iname "*.zip" \
+            -not -path "./.git/*" \
+            -not -path "./.github/*" \
             -delete
 
           echo "Temporary files removed."
 
-      - name: Verify application
+      - name: Verify final repository
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "========== Repository =========="
-          find . -maxdepth 3 \
-            -not -path './.git/*' \
-            -not -path './.github/*' \
-            -print | sort
+          echo "========== Final repository =========="
+
+          find . \
+            -maxdepth 5 \
+            -not -path "./.git/*" \
+            -not -path "./.github/*" \
+            -print \
+            | sort
 
           echo
           echo "========== Python syntax check =========="
 
           if [ -f "main.py" ]; then
             python3 -m py_compile main.py
-            echo "main.py OK"
-          else
-            echo "WARNING: main.py not found."
+            echo "main.py syntax: OK"
           fi
 
-      - name: Commit and push changes
+          echo
+          echo "========== Required files =========="
+
+          test -f "main.py"
+          test -f "requirements.txt"
+          test -f "templates/index.html"
+          test -f "static/main.js"
+          test -f "static/style.css"
+
+          echo "Required files: OK"
+
+      - name: Commit changes
         shell: bash
         run: |
           set -euo pipefail
@@ -164,9 +288,17 @@ jobs:
           git add -A
 
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            echo "No changes detected."
             exit 0
           fi
 
           git commit -m "Update application from uploaded ZIP"
-          git push
+
+      - name: Push changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git push origin HEAD:${GITHUB_REF_NAME}
+
+          echo "Changes pushed successfully."
